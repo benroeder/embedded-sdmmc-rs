@@ -1306,20 +1306,19 @@ impl FatVolume {
         }
         self.update_fat(block_cache, cluster, ClusterId::END_OF_FILE)?;
         loop {
-            match self.next_cluster(block_cache, next) {
-                Ok(n) => {
-                    self.update_fat(block_cache, next, ClusterId::EMPTY)?;
-                    next = n;
-                }
-                Err(Error::EndOfFile) => {
-                    self.update_fat(block_cache, next, ClusterId::EMPTY)?;
-                    break;
-                }
+            let after = match self.next_cluster(block_cache, next) {
+                Ok(n) => Some(n),
+                Err(Error::EndOfFile) => None,
                 Err(e) => return Err(e),
-            }
+            };
+            self.update_fat(block_cache, next, ClusterId::EMPTY)?;
             if let Some(ref mut number_free_cluster) = self.free_clusters_count {
                 *number_free_cluster += 1;
             };
+            match after {
+                Some(n) => next = n,
+                None => break,
+            }
         }
         Ok(())
     }
