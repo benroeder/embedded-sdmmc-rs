@@ -204,3 +204,40 @@ fn delete_frees_clusters_fat32() {
     // About 320 MiB free on the FAT32 partition.
     delete_frees_clusters(VolumeIdx(1), 8, 50);
 }
+
+/// FSInfo's free cluster count is only a hint. One that is too low must not
+/// underflow as clusters are allocated: the count becomes unknown, and is
+/// saved as unknown (0xFFFF_FFFF).
+#[test]
+fn free_count_too_low_becomes_unknown() {
+    use embedded_sdmmc::{Block, BlockDevice, BlockIdx};
+    // The FAT32 partition starts at block 264192; its FSInfo sector is the
+    // next one, with the free count at byte 488.
+    const FSINFO: BlockIdx = BlockIdx(264192 + 1);
+    let time_source = utils::make_time_source();
+    let disk = utils::make_block_device(utils::DISK_SOURCE).unwrap();
+    let mut block = [Block::new()];
+    disk.read(&mut block, FSINFO).unwrap();
+    block[0].contents[488..492].copy_from_slice(&1u32.to_le_bytes());
+    disk.write(&block, FSINFO).unwrap();
+
+    let volume_mgr: VolumeManager<utils::RamDisk<Vec<u8>>, utils::TestTimeSource, 4, 2, 1> =
+        VolumeManager::new_with_limits(disk, time_source, 0xAA00_0000);
+    let volume = volume_mgr
+        .open_raw_volume(VolumeIdx(1))
+        .expect("open volume");
+    let root_dir = volume_mgr.open_root_dir(volume).expect("open root dir");
+    let f = volume_mgr
+        .open_file_in_dir(root_dir, "LOW.DAT", Mode::ReadWriteCreateOrTruncate)
+        .expect("open file");
+    volume_mgr
+        .write(f, &vec![0xCC; 1024 * 1024])
+        .expect("file write");
+    volume_mgr.close_file(f).expect("close file");
+    volume_mgr.close_dir(root_dir).expect("close dir");
+    volume_mgr.close_volume(volume).expect("close volume");
+
+    let (disk, _time_source) = volume_mgr.free();
+    disk.read(&mut block, FSINFO).unwrap();
+    assert_eq!(block[0].contents[488..492], 0xFFFF_FFFFu32.to_le_bytes());
+}

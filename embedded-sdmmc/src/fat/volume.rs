@@ -194,9 +194,9 @@ impl FatVolume {
                 let block = block_cache
                     .read_mut(fat32_info.info_location)
                     .map_err(Error::DeviceError)?;
-                if let Some(count) = self.free_clusters_count {
-                    block[488..492].copy_from_slice(&count.to_le_bytes());
-                }
+                // 0xFFFF_FFFF is the "unknown" value of the spec
+                let count = self.free_clusters_count.unwrap_or(0xFFFF_FFFF);
+                block[488..492].copy_from_slice(&count.to_le_bytes());
                 if let Some(next_free_cluster) = self.next_free_cluster {
                     block[492..496].copy_from_slice(&next_free_cluster.0.to_le_bytes());
                 }
@@ -1223,10 +1223,10 @@ impl FatVolume {
                 Err(e) => return Err(e),
             };
         debug!("Next free cluster is {:?}", self.next_free_cluster);
-        // Record that we've allocated a cluster
-        if let Some(ref mut number_free_cluster) = self.free_clusters_count {
-            *number_free_cluster -= 1;
-        };
+        // Record that we've allocated a cluster. The count is only a hint
+        // (FSInfo may be stale): one that would go below zero is wrong, so it
+        // becomes unknown.
+        self.free_clusters_count = self.free_clusters_count.and_then(|n| n.checked_sub(1));
         if zero {
             let start_block_idx = self.cluster_to_block(new_cluster);
             let num_blocks = BlockCount(u32::from(self.blocks_per_cluster));
