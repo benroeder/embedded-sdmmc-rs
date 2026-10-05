@@ -1223,10 +1223,12 @@ impl FatVolume {
                 Err(e) => return Err(e),
             };
         debug!("Next free cluster is {:?}", self.next_free_cluster);
-        // Record that we've allocated a cluster. The count is only a hint
-        // (FSInfo may be stale): one that would go below zero is wrong, so it
-        // becomes unknown.
-        self.free_clusters_count = self.free_clusters_count.and_then(|n| n.checked_sub(1));
+        // Record that we've allocated a cluster
+        if let Some(number_free_cluster) = self.free_clusters_count {
+            // The count is only a hint: one that would go below zero is
+            // wrong, so it becomes unknown
+            self.free_clusters_count = number_free_cluster.checked_sub(1);
+        };
         if zero {
             let start_block_idx = self.cluster_to_block(new_cluster);
             let num_blocks = BlockCount(u32::from(self.blocks_per_cluster));
@@ -1250,29 +1252,35 @@ impl FatVolume {
         D: BlockDevice,
     {
         if first_cluster.0 < RESERVED_ENTRIES {
-            // An empty file has no cluster allocated, there is nothing to free
+            // file doesn't have any valid cluster allocated, there is nothing to do
             return Ok(());
         }
-        let mut cluster = first_cluster;
+        if let Some(ref mut next_free_cluster) = self.next_free_cluster {
+            if next_free_cluster.0 > first_cluster.0 {
+                *next_free_cluster = first_cluster;
+            }
+        } else {
+            self.next_free_cluster = Some(first_cluster);
+        }
+        let mut next = first_cluster;
         loop {
-            // Read the link before the entry holding it is overwritten
-            let next = match self.next_cluster(block_cache, cluster) {
-                Ok(n) => Some(n),
-                Err(Error::EndOfFile) => None,
+            match self.next_cluster(block_cache, next) {
+                Ok(n) => {
+                    self.update_fat(block_cache, next, ClusterId::EMPTY)?;
+                    next = n;
+                }
+                Err(Error::EndOfFile) => {
+                    self.update_fat(block_cache, next, ClusterId::EMPTY)?;
+                    if let Some(ref mut number_free_cluster) = self.free_clusters_count {
+                        *number_free_cluster += 1;
+                    };
+                    break;
+                }
                 Err(e) => return Err(e),
-            };
-            self.update_fat(block_cache, cluster, ClusterId::EMPTY)?;
+            }
             if let Some(ref mut number_free_cluster) = self.free_clusters_count {
                 *number_free_cluster += 1;
-            }
-            match next {
-                Some(n) => cluster = n,
-                None => break,
-            }
-        }
-        match self.next_free_cluster {
-            Some(next_free_cluster) if next_free_cluster.0 <= first_cluster.0 => {}
-            _ => self.next_free_cluster = Some(first_cluster),
+            };
         }
         Ok(())
     }
@@ -1306,19 +1314,23 @@ impl FatVolume {
         }
         self.update_fat(block_cache, cluster, ClusterId::END_OF_FILE)?;
         loop {
-            let after = match self.next_cluster(block_cache, next) {
-                Ok(n) => Some(n),
-                Err(Error::EndOfFile) => None,
+            match self.next_cluster(block_cache, next) {
+                Ok(n) => {
+                    self.update_fat(block_cache, next, ClusterId::EMPTY)?;
+                    next = n;
+                }
+                Err(Error::EndOfFile) => {
+                    self.update_fat(block_cache, next, ClusterId::EMPTY)?;
+                    if let Some(ref mut number_free_cluster) = self.free_clusters_count {
+                        *number_free_cluster += 1;
+                    };
+                    break;
+                }
                 Err(e) => return Err(e),
-            };
-            self.update_fat(block_cache, next, ClusterId::EMPTY)?;
+            }
             if let Some(ref mut number_free_cluster) = self.free_clusters_count {
                 *number_free_cluster += 1;
             };
-            match after {
-                Some(n) => next = n,
-                None => break,
-            }
         }
         Ok(())
     }
