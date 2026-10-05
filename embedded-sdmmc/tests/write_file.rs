@@ -167,9 +167,25 @@ fn random_access_write_file() {
 //
 // ****************************************************************************
 
+/// The FAT32 partition starts at block 264192; its FSInfo sector is the next
+/// one, with the free cluster count at byte 488.
+const FAT32_FSINFO: embedded_sdmmc::BlockIdx = embedded_sdmmc::BlockIdx(264192 + 1);
+
+fn free_count(disk: &utils::RamDisk<Vec<u8>>) -> u32 {
+    use embedded_sdmmc::{Block, BlockDevice};
+    let mut block = [Block::new()];
+    disk.read(&mut block, FAT32_FSINFO).unwrap();
+    u32::from_le_bytes(block[0].contents[488..492].try_into().unwrap())
+}
+
 /// Write and delete a 1 MiB file more times than the free space would hold:
 /// fails with a full disk if delete leaves the file's clusters allocated.
-fn delete_frees_clusters(volume_idx: VolumeIdx, file_mib: usize, rounds: usize) {
+/// Returns the disk once the volume is closed.
+fn delete_frees_clusters(
+    volume_idx: VolumeIdx,
+    file_mib: usize,
+    rounds: usize,
+) -> utils::RamDisk<Vec<u8>> {
     let time_source = utils::make_time_source();
     let disk = utils::make_block_device(utils::DISK_SOURCE).unwrap();
     let volume_mgr: VolumeManager<utils::RamDisk<Vec<u8>>, utils::TestTimeSource, 4, 2, 1> =
@@ -191,6 +207,7 @@ fn delete_frees_clusters(volume_idx: VolumeIdx, file_mib: usize, rounds: usize) 
     }
     volume_mgr.close_dir(root_dir).expect("close dir");
     volume_mgr.close_volume(volume).expect("close volume");
+    volume_mgr.free().0
 }
 
 #[test]
@@ -201,8 +218,110 @@ fn delete_frees_clusters_fat16() {
 
 #[test]
 fn delete_frees_clusters_fat32() {
+    let before = free_count(&utils::make_block_device(utils::DISK_SOURCE).unwrap());
     // About 320 MiB free on the FAT32 partition.
-    delete_frees_clusters(VolumeIdx(1), 8, 50);
+    let disk = delete_frees_clusters(VolumeIdx(1), 8, 50);
+    // Every cluster allocated was freed and counted again
+    assert_eq!(free_count(&disk), before);
+}
+
+#[test]
+fn truncate_counts_every_freed_cluster() {
+    let time_source = utils::make_time_source();
+    let disk = utils::make_block_device(utils::DISK_SOURCE).unwrap();
+    let before = free_count(&disk);
+    let volume_mgr: VolumeManager<utils::RamDisk<Vec<u8>>, utils::TestTimeSource, 4, 2, 1> =
+        VolumeManager::new_with_limits(disk, time_source, 0xAA00_0000);
+    let volume = volume_mgr
+        .open_raw_volume(VolumeIdx(1))
+        .expect("open volume");
+    let root_dir = volume_mgr.open_root_dir(volume).expect("open root dir");
+    let f = volume_mgr
+        .open_file_in_dir(root_dir, "TRUNC.DAT", Mode::ReadWriteCreateOrTruncate)
+        .expect("open file");
+    volume_mgr
+        .write(f, &vec![0xCC; 1024 * 1024])
+        .expect("file write");
+    volume_mgr.close_file(f).expect("close file");
+    let f = volume_mgr
+        .open_file_in_dir(root_dir, "TRUNC.DAT", Mode::ReadWriteTruncate)
+        .expect("open file");
+    volume_mgr.close_file(f).expect("close file");
+    volume_mgr.close_dir(root_dir).expect("close dir");
+    volume_mgr.close_volume(volume).expect("close volume");
+    // A truncated file keeps its first cluster
+    assert_eq!(free_count(&volume_mgr.free().0), before - 1);
+}
+
+#[test]
+fn delete_stops_at_a_link_outside_the_volume() {
+    use embedded_sdmmc::{Block, BlockDevice, BlockIdx};
+    // The FAT16 partition starts at block 2048.
+    const PARTITION: u32 = 2048;
+    let time_source = utils::make_time_source();
+    let disk = utils::make_block_device(utils::DISK_SOURCE).unwrap();
+    let volume_mgr: VolumeManager<utils::RamDisk<Vec<u8>>, utils::TestTimeSource, 4, 2, 1> =
+        VolumeManager::new_with_limits(disk, time_source, 0xAA00_0000);
+    let volume = volume_mgr
+        .open_raw_volume(VolumeIdx(0))
+        .expect("open volume");
+    let root_dir = volume_mgr.open_root_dir(volume).expect("open root dir");
+    let f = volume_mgr
+        .open_file_in_dir(root_dir, "BROKEN.DAT", Mode::ReadWriteCreateOrTruncate)
+        .expect("open file");
+    volume_mgr
+        .write(f, &vec![0xCC; 64 * 1024])
+        .expect("file write");
+    volume_mgr.close_file(f).expect("close file");
+    let entry = volume_mgr
+        .find_directory_entry(root_dir, "BROKEN.DAT")
+        .expect("find entry");
+    volume_mgr.close_dir(root_dir).expect("close dir");
+    volume_mgr.close_volume(volume).expect("close volume");
+    let (disk, time_source) = volume_mgr.free();
+
+    // The file's first cluster, from its directory entry
+    let mut block = [Block::new()];
+    disk.read(&mut block, entry.entry_block).unwrap();
+    let e = &block[0].contents[entry.entry_offset as usize..];
+    let first = u32::from(u16::from_le_bytes([e[26], e[27]]));
+    // Point that cluster's FAT16 entry at cluster 0, as a chain crossing a
+    // cluster another delete freed would
+    let mut boot = [Block::new()];
+    disk.read(&mut boot, BlockIdx(PARTITION)).unwrap();
+    let reserved = u32::from(u16::from_le_bytes([
+        boot[0].contents[14],
+        boot[0].contents[15],
+    ]));
+    let fat_start = PARTITION + reserved;
+    let fat_block = BlockIdx(fat_start + first * 2 / 512);
+    disk.read(&mut block, fat_block).unwrap();
+    let at = (first * 2 % 512) as usize;
+    block[0].contents[at..at + 2].copy_from_slice(&0u16.to_le_bytes());
+    disk.write(&block, fat_block).unwrap();
+    let mut fat0_before = [Block::new()];
+    disk.read(&mut fat0_before, BlockIdx(fat_start)).unwrap();
+
+    let volume_mgr: VolumeManager<utils::RamDisk<Vec<u8>>, utils::TestTimeSource, 4, 2, 1> =
+        VolumeManager::new_with_limits(disk, time_source, 0xAA00_0000);
+    let volume = volume_mgr
+        .open_raw_volume(VolumeIdx(0))
+        .expect("open volume");
+    let root_dir = volume_mgr.open_root_dir(volume).expect("open root dir");
+    assert!(matches!(
+        volume_mgr.delete_entry_in_dir(root_dir, "BROKEN.DAT"),
+        Err(embedded_sdmmc::Error::FormatError(_))
+    ));
+    volume_mgr.close_dir(root_dir).expect("close dir");
+    volume_mgr.close_volume(volume).expect("close volume");
+    // FAT[0] and FAT[1] (the media descriptor) are untouched
+    let mut fat0_after = [Block::new()];
+    volume_mgr
+        .free()
+        .0
+        .read(&mut fat0_after, BlockIdx(fat_start))
+        .unwrap();
+    assert_eq!(fat0_after[0].contents[0..4], fat0_before[0].contents[0..4]);
 }
 
 /// FSInfo's free cluster count is only a hint. One that is too low must not
@@ -211,9 +330,7 @@ fn delete_frees_clusters_fat32() {
 #[test]
 fn free_count_too_low_becomes_unknown() {
     use embedded_sdmmc::{Block, BlockDevice, BlockIdx};
-    // The FAT32 partition starts at block 264192; its FSInfo sector is the
-    // next one, with the free count at byte 488.
-    const FSINFO: BlockIdx = BlockIdx(264192 + 1);
+    const FSINFO: BlockIdx = FAT32_FSINFO;
     let time_source = utils::make_time_source();
     let disk = utils::make_block_device(utils::DISK_SOURCE).unwrap();
     let mut block = [Block::new()];

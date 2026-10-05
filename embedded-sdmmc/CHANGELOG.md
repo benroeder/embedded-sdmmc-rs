@@ -10,7 +10,8 @@ The format is based on [Keep a Changelog] and this project adheres to [Semantic 
 
 - Fixed `delete_entry_in_dir` leaving the deleted entry's clusters allocated (the space was lost until a disk check)
 - Fixed `truncate_cluster_chain` not counting the last cluster it frees in the free cluster count
-- Fixed the free cluster count underflowing when the stored count is too low; it now becomes unknown (saved as `0xFFFF_FFFF`)
+- Fixed the free cluster count underflowing when the stored count is too low, or overflowing when it is too high; it now becomes unknown (saved as `0xFFFF_FFFF`)
+- Freeing a cluster chain (delete, truncate) now stops with `Error::FormatError` at a link outside the volume, instead of freeing cluster 0 or writing outside the FAT
 
 ## [Version 0.10.0] - 2026-07-24
 

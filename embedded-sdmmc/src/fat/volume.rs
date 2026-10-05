@@ -1242,6 +1242,22 @@ impl FatVolume {
         Ok(new_cluster)
     }
 
+    /// Is `cluster` one of this volume's data clusters?
+    fn is_data_cluster(&self, cluster: ClusterId) -> bool {
+        cluster.0 >= RESERVED_ENTRIES && cluster.0 < self.cluster_count + RESERVED_ENTRIES
+    }
+
+    /// Record that we've freed a cluster
+    fn count_freed_cluster(&mut self) {
+        if let Some(number_free_cluster) = self.free_clusters_count {
+            // The count is only a hint: one that would go above the number of
+            // clusters is wrong, so it becomes unknown
+            self.free_clusters_count = number_free_cluster
+                .checked_add(1)
+                .filter(|n| *n <= self.cluster_count);
+        };
+    }
+
     /// Marks every cluster in the chain starting at `first_cluster` as free
     pub(crate) fn free_cluster_chain<D>(
         &mut self,
@@ -1255,6 +1271,9 @@ impl FatVolume {
             // file doesn't have any valid cluster allocated, there is nothing to do
             return Ok(());
         }
+        if !self.is_data_cluster(first_cluster) {
+            return Err(Error::FormatError("cluster chain leaves the volume"));
+        }
         if let Some(ref mut next_free_cluster) = self.next_free_cluster {
             if next_free_cluster.0 > first_cluster.0 {
                 *next_free_cluster = first_cluster;
@@ -1266,21 +1285,20 @@ impl FatVolume {
         loop {
             match self.next_cluster(block_cache, next) {
                 Ok(n) => {
+                    if !self.is_data_cluster(n) {
+                        return Err(Error::FormatError("cluster chain leaves the volume"));
+                    }
                     self.update_fat(block_cache, next, ClusterId::EMPTY)?;
                     next = n;
                 }
                 Err(Error::EndOfFile) => {
                     self.update_fat(block_cache, next, ClusterId::EMPTY)?;
-                    if let Some(ref mut number_free_cluster) = self.free_clusters_count {
-                        *number_free_cluster += 1;
-                    };
+                    self.count_freed_cluster();
                     break;
                 }
                 Err(e) => return Err(e),
             }
-            if let Some(ref mut number_free_cluster) = self.free_clusters_count {
-                *number_free_cluster += 1;
-            };
+            self.count_freed_cluster();
         }
         Ok(())
     }
@@ -1300,7 +1318,8 @@ impl FatVolume {
         }
         let mut next = {
             match self.next_cluster(block_cache, cluster) {
-                Ok(n) => n,
+                Ok(n) if self.is_data_cluster(n) => n,
+                Ok(_) => return Err(Error::FormatError("cluster chain leaves the volume")),
                 Err(Error::EndOfFile) => return Ok(()),
                 Err(e) => return Err(e),
             }
@@ -1316,21 +1335,20 @@ impl FatVolume {
         loop {
             match self.next_cluster(block_cache, next) {
                 Ok(n) => {
+                    if !self.is_data_cluster(n) {
+                        return Err(Error::FormatError("cluster chain leaves the volume"));
+                    }
                     self.update_fat(block_cache, next, ClusterId::EMPTY)?;
                     next = n;
                 }
                 Err(Error::EndOfFile) => {
                     self.update_fat(block_cache, next, ClusterId::EMPTY)?;
-                    if let Some(ref mut number_free_cluster) = self.free_clusters_count {
-                        *number_free_cluster += 1;
-                    };
+                    self.count_freed_cluster();
                     break;
                 }
                 Err(e) => return Err(e),
             }
-            if let Some(ref mut number_free_cluster) = self.free_clusters_count {
-                *number_free_cluster += 1;
-            };
+            self.count_freed_cluster();
         }
         Ok(())
     }
