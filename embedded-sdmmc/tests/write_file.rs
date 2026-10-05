@@ -166,3 +166,41 @@ fn random_access_write_file() {
 // End Of File
 //
 // ****************************************************************************
+
+/// Write and delete a 1 MiB file more times than the free space would hold:
+/// fails with a full disk if delete leaves the file's clusters allocated.
+fn delete_frees_clusters(volume_idx: VolumeIdx, file_mib: usize, rounds: usize) {
+    let time_source = utils::make_time_source();
+    let disk = utils::make_block_device(utils::DISK_SOURCE).unwrap();
+    let volume_mgr: VolumeManager<utils::RamDisk<Vec<u8>>, utils::TestTimeSource, 4, 2, 1> =
+        VolumeManager::new_with_limits(disk, time_source, 0xAA00_0000);
+    let volume = volume_mgr.open_raw_volume(volume_idx).expect("open volume");
+    let root_dir = volume_mgr.open_root_dir(volume).expect("open root dir");
+    let test_data = vec![0xCC; file_mib * 1024 * 1024];
+    for round in 0..rounds {
+        let f = volume_mgr
+            .open_file_in_dir(root_dir, "LEAK.DAT", Mode::ReadWriteCreateOrTruncate)
+            .expect("open file");
+        volume_mgr
+            .write(f, &test_data)
+            .unwrap_or_else(|e| panic!("write in round {round}: {e:?}"));
+        volume_mgr.close_file(f).expect("close file");
+        volume_mgr
+            .delete_entry_in_dir(root_dir, "LEAK.DAT")
+            .expect("delete file");
+    }
+    volume_mgr.close_dir(root_dir).expect("close dir");
+    volume_mgr.close_volume(volume).expect("close volume");
+}
+
+#[test]
+fn delete_frees_clusters_fat16() {
+    // About 60 MiB free on the FAT16 partition.
+    delete_frees_clusters(VolumeIdx(0), 1, 80);
+}
+
+#[test]
+fn delete_frees_clusters_fat32() {
+    // About 320 MiB free on the FAT32 partition.
+    delete_frees_clusters(VolumeIdx(1), 8, 50);
+}

@@ -1240,6 +1240,43 @@ impl FatVolume {
         Ok(new_cluster)
     }
 
+    /// Marks every cluster in the chain starting at `first_cluster` as free
+    pub(crate) fn free_cluster_chain<D>(
+        &mut self,
+        block_cache: &mut BlockCache<D>,
+        first_cluster: ClusterId,
+    ) -> Result<(), Error<D::Error>>
+    where
+        D: BlockDevice,
+    {
+        if first_cluster.0 < RESERVED_ENTRIES {
+            // An empty file has no cluster allocated, there is nothing to free
+            return Ok(());
+        }
+        let mut cluster = first_cluster;
+        loop {
+            // Read the link before the entry holding it is overwritten
+            let next = match self.next_cluster(block_cache, cluster) {
+                Ok(n) => Some(n),
+                Err(Error::EndOfFile) => None,
+                Err(e) => return Err(e),
+            };
+            self.update_fat(block_cache, cluster, ClusterId::EMPTY)?;
+            if let Some(ref mut number_free_cluster) = self.free_clusters_count {
+                *number_free_cluster += 1;
+            }
+            match next {
+                Some(n) => cluster = n,
+                None => break,
+            }
+        }
+        match self.next_free_cluster {
+            Some(next_free_cluster) if next_free_cluster.0 <= first_cluster.0 => {}
+            _ => self.next_free_cluster = Some(first_cluster),
+        }
+        Ok(())
+    }
+
     /// Marks the input cluster as an EOF and all the subsequent clusters in the chain as free
     pub(crate) fn truncate_cluster_chain<D>(
         &mut self,

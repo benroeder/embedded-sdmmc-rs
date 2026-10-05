@@ -939,9 +939,13 @@ where
         }
 
         let volume_idx = data.get_volume_by_id(parent_dir_info.raw_volume)?;
-        match &data.open_volumes[volume_idx].volume_type {
+        match &mut data.open_volumes[volume_idx].volume_type {
             VolumeType::Fat(fat) => {
-                fat.delete_directory_entry(&mut data.block_cache, parent_dir_info, &sfn)?
+                fat.delete_directory_entry(&mut data.block_cache, parent_dir_info, &sfn)?;
+                // Free the data only once nothing points at it: a failure in
+                // between leaves lost clusters, never an entry whose clusters
+                // could be handed out again.
+                fat.free_cluster_chain(&mut data.block_cache, dir_entry.cluster)?;
             }
         }
 
